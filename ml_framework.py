@@ -7,14 +7,144 @@ import sys
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers,models, initializers
+from tensorflow.keras import layers, models, initializers, Model
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import KFold
 import keras_nlp
 
 
-#ViT
-class ViT50_3block(tf.keras.Model):
+####################################### KERAS EXAMPLE ViT from https://keras.io/examples/vision/image_classification_with_vision_transformer/ #############################
+
+#multilayer perceptron (MLP)
+def mlp(x, hidden_units, dropout_rate):
+    for units in hidden_units:
+        x = layers.Dense(units, activation=keras.activations.gelu)(x)
+        x = layers.Dropout(dropout_rate)(x)
+    return x
+
+class Patches(layers.Layer):
+    def __init__(self, patch_size):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def call(self, images):
+        batch_size = tf.shape(images)[0]
+        # Use static shapes for height, width, channels
+        height = images.shape[1]
+        width = images.shape[2]
+        channels = images.shape[3]
+        
+        num_patches_h = height // self.patch_size
+        num_patches_w = width // self.patch_size
+        #patches = tf.image.extract_patches(images, size=self.patch_size)
+        patches = tf.image.extract_patches( images=images,
+            sizes=[1, self.patch_size, self.patch_size, 1],
+            strides=[1, self.patch_size, self.patch_size, 1],
+            rates=[1, 1, 1, 1],
+            padding='VALID')
+        
+        patches = tf.reshape(
+            patches,
+            (
+                batch_size,
+                num_patches_h * num_patches_w,
+                self.patch_size * self.patch_size * channels,
+            ),
+        )
+        return patches
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"patch_size": self.patch_size})
+        return config
+
+class PatchEncoder(layers.Layer):
+    def __init__(self, num_patches, projection_dim):
+        super().__init__()
+        self.num_patches = num_patches
+        self.projection = layers.Dense(units=projection_dim)
+        self.position_embedding = layers.Embedding(
+            input_dim=num_patches, output_dim=projection_dim
+        )
+
+    def call(self, patch):
+        positions = tf.expand_dims(
+            tf.range(start=0, limit=self.num_patches, delta=1), axis=0
+        )
+        projected_patches = self.projection(patch)
+        encoded = projected_patches + self.position_embedding(positions)
+        return encoded
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"num_patches": self.num_patches})
+        return config
+
+
+def create_vit_classifier(img_size = 500, patch_size=20,num_classes=1,projection_dim = 64,transformer_layers = 3,num_heads = 8,mlp_head_units = [2048,1024],transformer_units = None):
+    
+    if transformer_units is None:
+        transformer_units = [projection_dim * 2,projection_dim]
+    
+    num_patches = (img_size // patch_size) ** 2
+    inputs = keras.Input(shape=(img_size,img_size,1))
+    # Augment data.
+    #augmented = data_augmentation(inputs)
+    augmented = inputs
+    # Create patches.
+    patches = Patches(patch_size)(augmented)
+    # Encode patches.
+    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+
+    # Create multiple layers of the Transformer block.
+    for _ in range(transformer_layers):
+        # Layer normalization 1.
+        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        # Create a multi-head attention layer.
+        attention_output = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
+        )(x1, x1)
+        # Skip connection 1.
+        x2 = layers.Add()([attention_output, encoded_patches])
+        # Layer normalization 2.
+        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+        # MLP.
+        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
+        # Skip connection 2.
+        encoded_patches = layers.Add()([x3, x2])
+
+    # Create a [batch_size, projection_dim] tensor.
+    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+    representation = layers.Flatten()(representation)
+    representation = layers.Dropout(0.5)(representation)
+    # Add MLP.
+    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
+    # Classify outputs.
+    logits = layers.Dense(num_classes)(features)
+    # Create the Keras model.
+    model = keras.Model(inputs=inputs, outputs=logits)
+    return model
+
+##################################################### OPTICUS ViT ########################################################################################
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, mlp_dim):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.norm1 = layers.LayerNormalization(epsilon=1e-5)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-5)
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(mlp_dim, activation='gelu'),
+            layers.Dense(embed_dim)
+        ])
+        
+    def call(self, x):
+        x_att = self.att(x, x)
+        x = self.norm1(x + x_att)
+        x_mlp = self.mlp(x)
+        x = self.norm2(x + x_mlp)
+        return x
+
+class ViT(Model):
     def __init__(self,
                  img_size=500,
                  patch_size=50,
@@ -31,9 +161,6 @@ class ViT50_3block(tf.keras.Model):
         # Patch embedding: Conv2D
         self.patch_embed = layers.Conv2D(embed_dim, kernel_size=patch_size, strides=patch_size, padding='valid')
 
-        # Flatten and project to sequence
-        self.flatten = layers.Reshape((-1, embed_dim))  # Will reshape to (B, 100, 256)
-
         # Learnable class token and positional embedding
         self.cls_token = self.add_weight("cls_token",
                                          shape=(1, 1, embed_dim),
@@ -47,13 +174,7 @@ class ViT50_3block(tf.keras.Model):
 
         # Transformer encoder layers
         self.transformer_layers = [
-            keras_nlp.layers.TransformerEncoder(
-                intermediate_dim=mlp_dim,
-                num_heads=num_heads,
-                activation="gelu",
-                dropout=0.0,
-                layer_norm_epsilon=1e-5
-            )
+            TransformerBlock(embed_dim, num_heads, mlp_dim)
             for _ in range(depth)
         ]
 
@@ -68,33 +189,39 @@ class ViT50_3block(tf.keras.Model):
         """
         B = tf.shape(inputs)[0]
 
-        # Patch embedding (B, 500, 500, 1) → (B, 10, 10, embed_dim)
-        x = self.patch_embed(inputs)
+        # (1) Patch Embedding
+        x = self.patch_embed(inputs)  # (B, 10, 10, embed_dim)
 
-        # Flatten to sequence (B, 10, 10, embed_dim) → (B, 100, embed_dim)
-        x = tf.reshape(x, [B, -1, x.shape[-1]])
+        # (2) Flatten & Transpose to (B, num_patches, embed_dim)
+        x = tf.reshape(x, [B, -1, x.shape[-1]])  # (B, 100, embed_dim)
 
-        # Add class token (B, 1, embed_dim)
+        # (3) Add CLS token
         cls_tokens = tf.broadcast_to(self.cls_token, [B, 1, x.shape[-1]])
         x = tf.concat([cls_tokens, x], axis=1)  # (B, 101, embed_dim)
 
-        # Add positional embedding
+        # (4) Add positional embedding
         x = x + self.pos_embed
 
-        # Transformer encoder
+        # (5) Transformer encoder
         for layer in self.transformer_layers:
             x = layer(x)
 
-        # Use CLS token output
+        # (6) Use CLS token output
         cls_out = x[:, 0]  # (B, embed_dim)
 
-        # Regression head
-        return tf.squeeze(self.head(cls_out), axis=-1)
+        # (7) Regression head
+        out = self.head(cls_out)  # (B, 1)
+        return tf.squeeze(out, axis=-1)  # (B,)
 
 
 
 
-#experimental found values
+
+
+
+
+########################################################### Noise Model ################################################################################################
+#experimental found values for noise model
 offset = -238.3010098283891
 amplitude = 0.8593836419304328
 exponent = 0.5148938848756486
@@ -115,7 +242,7 @@ def noise_randomizer(average):
     
 noisemodel = np.vectorize(noise_randomizer)
 
-
+####################################################################### MACHINE LEARNING FRAMEWORK ################################################################
 
 class ML_Framework:
     '''MLFramework is a class for training a neural network on images from simulations produced by CamSim.'''
@@ -159,6 +286,9 @@ class ML_Framework:
         self.values = {} #dictionary storing 'case name': value of variables
         self.modellist = [] #list of variables names that are different between cases
         self.model = None #the machine learning model
+        self.mean = None #the mean used to normalize the dataset
+        self.std = None #the stddev used to normalize the dataset
+        
         if variables_list == 'default':
             self.variables_list = ['Absorption','Scattering','hole_scatt',"hole_radius",'beam_width', 'orientation', 'tilt', 'position','hole_offset']
             
@@ -264,9 +394,9 @@ class ML_Framework:
             self.modellist = [x[1] for x in uniq_variables]
             
 
-    def make_images(self,number_of_images=100,noise_func='default',exposure=1000,use_weights=True,conv=1.6639,gain=0,lens_model=None,test_size=0.1,from_indices=False):
-        '''make_images(number_of_images=100,noise_func='default',exposure=1000,use_weights=True,conv=1.6639,gain=0,lens_model=None,from_saved=None,
-        test_size=0.1, from_indices=False): where number_of_images is the number of images to generate, exposure is the exposure time in ms, 
+    def make_images(self,number_of_images=100,noise_func='default',exposure=1000,use_weights=True,conv=1.6639,gain=0,lens_model=None,test_size=0.1, val_size=0.2, from_indices=False):
+        '''make_images(number_of_images=100,noise_func='default',exposure=1000,use_weights=True,conv=1.6639,gain=0,lens_model=None,
+        test_size=0.1, val_size=0.2, from_indices=False): where number_of_images is the number of images to generate, exposure is the exposure time in ms, 
         use_weights is set to true if we want to use pixel counts instead of  
         photon counts,conv is the conversion factor to use when converting photon counts 
         to pixel values,gain is the gain of the sensor,
@@ -275,9 +405,11 @@ class ML_Framework:
         set based on resolution or can use a json file or choose 'pinhole' for a pinhole camera, 
         noise_func is the noise function to use to add noise to the images, test_size 
         is the percentage of images made that will be held out for a final test used in the test_model function.
+        val_size is the percentage of images that will be used for validation if you use the train test split function. 
         from_indices means that you used grid computing and the combine_images function to make a final images .npy file, this will 
         use that file instead of your lower statistic images, don't use noise when using combine_images. Makes a dataset of images that 
-        other functions will use to train/test your model, they will be saved in your output directory.'''
+        other functions will use to train/validate/test your model, they will be saved in your output directory. Only have to use once then can
+        train on this same set of images many different models. This function also normalizes the data set based on the training set.'''
 
         images_dict = {}
         
@@ -312,67 +444,71 @@ class ML_Framework:
             x.append(image_list)
             y += [self.values[folder]] * len(image_list)
         
-        x = np.concatenate(x)
+        x = np.array(np.concatenate(x))
         y = np.array(y)
-        
-        #lets also normalize images 
-        x_norm = []
-        for image in x:
-            x_norm.append((image - np.mean(image))/np.std(image))
-        x_norm = np.array(x_norm)  
         #and finally add channel at end
-        x_norm = x_norm[..., np.newaxis]
+        x = x[..., np.newaxis]
 
         # Shuffle
         perm = np.random.permutation(len(y))
-        x_shuffled = x_norm[perm]
+        x_shuffled = x[perm]
         y_shuffled = y[perm]
         
         # Compute split index
-        split_index = int(len(x_shuffled) * (1 - test_size))
-        
+        split_index1 = int(len(x_shuffled) * (1 - test_size - val_size))
+        split_index2 = int(len(x_shuffled)*(1-test_size))
         # Correct train-test split
-        x_train = x_shuffled[:split_index]
-        x_test  = x_shuffled[split_index:]
-        y_train = y_shuffled[:split_index]
-        y_test  = y_shuffled[split_index:]
+        x_train = x_shuffled[:split_index1]
+        x_val = x_shuffled[split_index1:split_index2]
+        x_test  = x_shuffled[split_index2:]
+        y_train = y_shuffled[:split_index1]
+        y_val = y_shuffled[split_index1:split_index2]
+        y_test  = y_shuffled[split_index2:]
         
+        #normalize x 
+        self.mean = np.mean(x_train)
+        self.std = np.std(x_train)
+        x_train = (x_train - self.mean) / self.std
+        x_val = (x_val - self.mean) / self.std
+        x_test = (x_test - self.mean) / self.std
         # Save
         np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_x.npy', x_train)
         np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_y.npy', y_train)
+        np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_x.npy', x_val)
+        np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_y.npy', y_val)
         np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}test_x.npy', x_test)
         np.save(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}test_y.npy', y_test)
+        np.save(self.out_dir+'norm_constants.npy',np.array([self.mean, self.std]))
             
-    def train_NN_ttsplit(self,model, optimizer, loss, epochs=10, batch_size=32, metrics=None, val_size=0.2, random_state=1,plot=True, plot_metrics=True):
-        '''train_NN_ttsplit(model,optimizer,loss,epochs=10,batch_size=32,metrics=None,val_size=0.2,random_state=1,plot=True,plot_metrics=True),model is a keras 
-        neural network model (make sure that your final layer is a Dense layer with size equal to the number of variables you are trying to predict and 
+    def train_NN_ttsplit(self,model, optimizer, loss, epochs=10, batch_size=32, metrics=None, plot=True, plot_metrics=True):
+        '''train_NN_ttsplit(model,optimizer,loss,epochs=10,batch_size=32,metrics=None, plot=True,plot_metrics=True),model is a keras 
+        neural network model (make sure that your final layer is a Dense layer with size equal to the number of variables/classes you are trying to predict and 
         input_shape = (resolution.x, resolution.y,1) for the first layer), optimizer is the name of the optimizer you want to use from keras, 
         loss is the name of the loss you want to use from keras or your own defined loss function which 
         must work on tensorflow tensors output must be a scalar averaged or summed over the batch, epochs
         is the number of times to iterate completely over the dataset during training, batch_size is the number of images to train on at once, 
-        metrics is a list of metrics from keras you want to evaluate your model with, val_size is the 
-        percentage of the dataset to hold out for validation during training, random_state is the random state of the train test split, plot is set to true to plot the loss over 
+        metrics is a list of metrics from keras you want to evaluate your model with, plot is set to true to plot the loss over 
         epochs, plot_metrics is set to true to plot the metrics you chose over the epochs.
         Given a neural network keras model it will train on the images in output directory. Returns a keras history object.'''
-        images = np.array([])
-        truths = np.array([])
+        X_train, X_val = np.array([]), np.array([])
+        y_train, y_val = np.array([]), np.array([])
         try:
-            images = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_x.npy')
-            truths = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_y.npy')
-            #print("TRAIN SIZE: ", len(images))
+            self.mean, self.std = np.load(self.out_dir+'norm_constants.npy')
+            X_train = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_x.npy')
+            X_val = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_x.npy')
+            y_train = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_y.npy')
+            y_val = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_y.npy')
         except e:
             print(e)
             print("No images found, run make_images first.")
             return
             
-        X_train, X_test, y_train, y_test = train_test_split(images, truths, test_size=val_size, random_state=random_state)
-        
         if metrics is None:
             model.compile(optimizer=optimizer, loss=loss)
         else:
             model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
         
-        history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=epochs, batch_size=batch_size)
+        history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=epochs, batch_size=batch_size)
 
         #plotting of loss, predictions for validation set, and metrics
         if plot:
@@ -409,19 +545,28 @@ class ML_Framework:
         '''train_NN_ttsplit(model,optimizer,loss,epochs=10,batch_size=32,metrics=None,test_size=0.2,random_state=1,plot=True,plot_metrics=True), model is a keras 
         neural network model (make sure that your final layer is a Dense layer with size equal to the number of variables you are trying to predict and 
         input_shape = (resolution.x, resolution.y,1) for the first layer), optimizer is the name of the optimizer you want to use from keras, 
-        loss is the name of the loss you want to use from keras or your own defined loss function which must work on tensorflow tensors output must be a scalar averaged or summed over the batch, epochs is the number of times to iterate completely over the dataset during 
+        loss is the name of the loss you want to use from keras or your own defined loss function which must work on tensorflow tensors output 
+        must be a scalar averaged or summed over the batch, epochs is the number of times to iterate completely over the dataset during 
         training, batch_size is the number of images to train on at once, 
         metrics is a list of metrics from keras you want to evaluate your model with, k is the number of folds to use for the kfold cross validation,
         shuffle is true means the data in each fold is randomly selected, random_state is the random state of the selected folds, plot is set 
         to true to plot the mean loss (over folds) vs epochs, plot_metrics is set to true to plot the mean metrics you chose (over folds) over the epochs.
-        Trains a given model using kfold cross validation (keeps trained the model on the last fold). Returns a dictionary containing the final loss and metrics mean over the 
-        k folds and also the standard deviation of the loss and metrics over the k folds.'''
+        Trains a given model using kfold cross validation (keeps trained the model on the last fold) using both training and validation data
+        and renormalizes the training and validation data based on the training data of each fold. No model is saved.
+        Returns a dictionary containing the final loss and metrics mean over the k folds and also the standard deviation of 
+        the loss and metrics over the k folds.'''
 
         images = np.array([])
         truths = np.array([])
         try:
-            images = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_x.npy')
-            truths = np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_y.npy')
+            self.mean, self.std = np.load(self.out_dir+'norm_constants.npy')
+            images = np.concatenate((np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_x.npy'),
+                                     np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_x.npy')))
+            truths = np.concatenate((np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}train_y.npy'),
+                                     np.load(f'{self.out_dir}CAM_{self.num_camera[0]}_{self.num_camera[1]}_{self.num_camera[2]}val_y.npy')))
+            #lets get them un-normalized
+            images = (images*self.std) + self.mean
+            
         except Exception as e:
             print(e)
             print("No images found, run make_images first.")
@@ -441,16 +586,21 @@ class ML_Framework:
                 # Split the data into training and validation sets for this fold
                 X_train_fold, X_val_fold = images[train_index], images[val_index]
                 y_train_fold, y_val_fold = truths[train_index], truths[val_index]
+
+                #Normalize over fold
+                fold_mean = np.mean(X_train_fold)
+                fold_std = np.std(X_train_fold)
+                X_train_fold = (X_train_fold - fold_mean)/fold_std
+                X_val_fold = (X_val_fold - fold_mean)/fold_std
                 
                 # Create a new instance of the model for each fold
                 model.compile(optimizer=optimizer, loss=loss)
                 
                 # Train the model on the training fold
-                history = model.fit(X_train_fold, y_train_fold,validation_data=(X_val_fold,y_val_fold), epochs=epochs, batch_size=batch_size, verbose=0)
+                history = model.fit(X_train_fold, y_train_fold,validation_data=(X_val_fold,y_val_fold), epochs=epochs, batch_size=batch_size, verbose=1)
                 
                 train_losses.append(history.history['loss'])
                 val_losses.append(history.history['val_loss'])
-                
                 
         else:
             for fold, (train_index, val_index) in enumerate(kf.split(images)):
@@ -460,17 +610,23 @@ class ML_Framework:
                 X_train_fold, X_val_fold = images[train_index], images[val_index]
                 y_train_fold, y_val_fold = truths[train_index], truths[val_index]
                 
+                #Normalize over fold
+                fold_mean = np.mean(X_train_fold)
+                fold_std = np.std(X_train_fold)
+                X_train_fold = (X_train_fold - fold_mean)/fold_std
+                X_val_fold = (X_val_fold - fold_mean)/fold_std
+                
                 # Create a new instance of the model for each fold
                 model.compile(optimizer=optimizer, loss=loss,metrics=metrics)
                 
                 # Train the model on the training fold
-                history = model.fit(X_train_fold, y_train_fold,validation_data=(X_val_fold,y_val_fold), epochs=epochs, batch_size=batch_size,verbose=0)
-                
+                history = model.fit(X_train_fold, y_train_fold,validation_data=(X_val_fold,y_val_fold), epochs=epochs, batch_size=batch_size,verbose=1)
                 train_losses.append(history.history['loss'])
                 val_losses.append(history.history['val_loss'])
                 for i,metric in enumerate(metrics):
                     metric_train_values[i].append(history.history[metric])
-                    metric_val_values[i].append(history.history['val_'+metric])        
+                    metric_val_values[i].append(history.history['val_'+metric])
+                    
         # Convert and average
         train_losses = np.array(train_losses)
         val_losses = np.array(val_losses)
@@ -496,7 +652,6 @@ class ML_Framework:
             plt.grid(True)
             plt.savefig(self.out_dir+'loss_curve.png')
             
-
         
         if plot_metrics and not metrics is None:
             for i,metric in enumerate(metrics):
@@ -509,8 +664,6 @@ class ML_Framework:
                 plt.legend()
                 plt.grid(True)
                 plt.savefig(self.out_dir+metric+'_curve.png')
-
-        self.model = model
 
         #create dictionary of important stats and return it
         #get mean loss of last epoch for all folds, and also standard deviation of the losses of the last epoch across the k folds
@@ -525,7 +678,7 @@ class ML_Framework:
         return stats
         
     def save_model(self):
-        '''save_model(), saves the most recently trained model using keras.'''
+        '''save_model(), saves the most recently trained model (that has used train test split) using keras.'''
         #check if we have made a model yet
         if self.model is None:
             return
@@ -533,22 +686,20 @@ class ML_Framework:
         self.model.save(self.out_dir)
 
     def predict(self,ims):
-        '''predict(ims), ims is a list of images to predict, they don't have to be normalized and shouldn't have a channel axis. 
+        '''predict(ims), ims is a list of images to predict, they shouldn't have a channel axis and shouldn't be normalized. 
         If you pass one image make sure to surround it in an array. 
         Uses the most recently trained model to predict parameter values from the images, returns those values. '''
         #check if we have made a model yet
         if self.model is None:
             return
             
-        #normalize
-        normalized_images = np.zeros(ims.shape)
-        for i,im in enumerate(ims):
-            normalized_images[i] = (im - np.mean(im))/np.std(im)
-
         #if we don't have channel dimension add that
-        if normalized_images.shape[-1] != 1:
-            normalized_images = normalized_images[..., np.newaxis]
-
+        if ims.shape[-1] != 1:
+            ims = ims[..., np.newaxis]
+            
+        #normalize
+        normalized_images = (ims - self.mean)/self.std
+        
         #return prediction
         return self.model.predict(normalized_images)
         
@@ -621,8 +772,15 @@ class ML_Framework:
         return self.model
         
     def load_model(self, directory):
-        '''load_model(directory), loads a keras model from a directory'''
+        '''load_model(directory), loads a keras model and normalization constants from a directory'''
+        norm_array = np.load(self.out_dir+'norm_constants.npy')
+        self.mean = norm_array[0]
+        self.std = norm_array[1]
         self.model = keras.models.load_model(directory)
+        
+    def get_normalization(self):
+        '''returns constants used for normalization of image dataset'''
+        return np.array([self.mean,self.std])
         
     def get_ViT(self,img_size=500,
                  patch_size=50,
@@ -631,15 +789,38 @@ class ML_Framework:
                  num_heads=8,
                  mlp_dim=512,
                  num_classes=1):
-        
-        return ViT50_3block(img_size=img_size,
+        '''
+        returns a keras model vision transformer with architecture similar to OPTICUS (created by Minje Park)
+        '''
+        return ViT(img_size=img_size,
                  patch_size=patch_size,
                  embed_dim=embed_dim,
                  depth=depth,
                  num_heads=num_heads,
                  mlp_dim=mlp_dim,
                  num_classes=num_classes)
-            
+        
+    def get_ViT2(self,img_size = 500, 
+                 patch_size=20,
+                 num_classes=1,
+                 projection_dim = 64,
+                 transformer_layers = 3,
+                 num_heads = 8,
+                 mlp_head_units = [2048,1024],
+                 transformer_units = None):
+        '''
+        returns a keras model vision transformer from a keras example here: https://keras.io/examples/vision/image_classification_with_vision_transformer/
+        '''
+        return create_vit_classifier(img_size = img_size, 
+                                     patch_size=
+                                     patch_size,
+                                     num_classes=num_classes,
+                                     projection_dim = projection_dim,
+                                     transformer_layers = transformer_layers,
+                                     num_heads = num_heads, 
+                                     mlp_head_units = mlp_head_units, 
+                                     transformer_units = transformer_units)
+    
             
         
         
